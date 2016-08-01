@@ -63,12 +63,8 @@ class FeedForwardModel(object):
         x = x.astype('float32')
         y = y.astype('float32')
         z = z.astype('float32')
-        print z.shape
-        k = self._debug_fn(x, y, z)
-        # for _ in xrange(30):
-        #     z = self._train_fn(x, y)
-        #     print z.shape
-        #     assert False
+        for _ in xrange(30):
+            loss = self._train_fn(x, y, z)
 
 
 
