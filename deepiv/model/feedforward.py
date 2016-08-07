@@ -35,21 +35,24 @@ class FeedForwardModel(object):
         instrument_vars = TT.matrix()
 
         instruments = layers.InputLayer((None, n_vars), instrument_vars)
+        instruments = layers.DropoutLayer(instruments, p=0.2)
 
-        dense_layer = layers.DenseLayer(instruments, kwargs['dense_size'], nonlinearity=nonlinearities.leaky_rectify)
-        dense_layer = layers.batch_norm(dense_layer)
+        dense_layer = layers.DenseLayer(instruments, kwargs['dense_size'], nonlinearity=nonlinearities.tanh)
+        dense_layer = layers.DropoutLayer(dense_layer, p=0.2)
 
         for _ in xrange(kwargs['n_dense_layers'] - 1):
-            dense_layer = layers.DenseLayer(dense_layer, kwargs['dense_size'], nonlinearity=nonlinearities.leaky_rectify)
-            dense_layer = layers.batch_norm(dense_layer)
+            dense_layer = layers.DenseLayer(dense_layer, kwargs['dense_size'], nonlinearity=nonlinearities.tanh)
+            dense_layer = layers.DropoutLayer(dense_layer, p=0.5)
 
-        self.instrument_output = layers.DenseLayer(dense_layer, 1, nonlinearity=nonlinearities.sigmoid)
+        self.instrument_output = layers.DenseLayer(dense_layer, 1, nonlinearity=nonlinearities.linear)
         init_params = layers.get_all_param_values(self.instrument_output)
-        prediction = layers.get_output(self.instrument_output)
+        prediction = layers.get_output(self.instrument_output, deterministic=False)
+        test_prediction = layers.get_output(self.instrument_output, deterministic=True)
 
         # flexible here, endog variable can be categorical, continuous, etc.
-        loss = objectives.binary_crossentropy(prediction.flatten(), targets.flatten()).mean()
-        loss_total = objectives.binary_crossentropy(prediction.flatten(), targets.flatten()).sum()
+        l2_cost = regularization.regularize_network_params(self.instrument_output, regularization.l2)
+        loss = objectives.squared_error(prediction.flatten(), targets.flatten()).mean() + 1e-4 * l2_cost
+        loss_total = objectives.squared_error(prediction.flatten(), targets.flatten()).mean()
 
         params = layers.get_all_params(self.instrument_output, trainable=True)
         param_updates = updates.adadelta(loss, params)
@@ -71,7 +74,7 @@ class FeedForwardModel(object):
             loss_total
         )
 
-        self._instrument_output_fn = theano.function([instrument_vars], prediction)
+        self._instrument_output_fn = theano.function([instrument_vars], test_prediction)
 
         return init_params
 
@@ -88,8 +91,9 @@ class FeedForwardModel(object):
         dense_layer = layers.batch_norm(dense_layer)
         dense_layer= layers.DropoutLayer(dense_layer, p=0.2)
 
-        dense_layer = layers.DenseLayer(dense_layer, kwargs['dense_size'], nonlinearity=nonlinearities.rectify)
-        dense_layer = layers.batch_norm(dense_layer)
+        for _ in xrange(kwargs['n_dense_layers'] - 1):
+            dense_layer = layers.DenseLayer(dense_layer, kwargs['dense_size'], nonlinearity=nonlinearities.rectify)
+            dense_layer = layers.batch_norm(dense_layer)
 
         self.treatment_output = layers.DenseLayer(dense_layer, 1, nonlinearity=nonlinearities.linear)
         init_params = layers.get_all_param_values(self.treatment_output)
@@ -97,7 +101,8 @@ class FeedForwardModel(object):
         prediction = layers.get_output(self.treatment_output, deterministic=False)
         test_prediction = layers.get_output(self.treatment_output, deterministic=True)
 
-        loss = gmm_loss(prediction, targets, instrument_vars)
+        l2_cost = regularization.regularize_network_params(self.treatment_output, regularization.l2)
+        loss = gmm_loss(prediction, targets, instrument_vars) + 1e-4 * l2_cost
 
         params = layers.get_all_params(self.treatment_output, trainable=True)
         param_updates = updates.adadelta(loss, params)
@@ -130,7 +135,46 @@ class FeedForwardModel(object):
 
         return init_params
 
-    def fit(self, x, z, y, instrument=False, **kwargs):
+    def fit_instruments(self, x, z, y, **kwargs):
+
+        def split_data(X, Z, y, test=0.5):
+            return train_test_split(X, Z, y, test_size=test, stratify=X[:, -1])
+
+        TOL = 10
+
+        x = x.astype('float32')
+        y = y.astype('float32')
+        z = z.astype('float32')
+
+        x_train, x_test, z_train, z_test, y_train, y_test  = split_data(x, z, y)
+
+        epochs_since_smallest = -1
+        smallest_loss = 1e10
+        epochs = 0
+        while epochs_since_smallest < TOL:
+            epochs += 1
+            training_loss = 0
+            for batch in iterate_minibatches(x_train, y_train, z_train, batchsize=kwargs['batchsize'], shuffle=True):
+                x_b, y_b, z_b = batch
+                training_loss += self._instrument_train_fn(x_b[:, -1], z_b)
+
+            test_loss = self._instrument_loss_fn(x_test[:, -1], z_test)
+
+            logger.debug("instrument model -> train loss: %.2f, epochs=%s", training_loss, epochs)
+            if test_loss < smallest_loss:
+                smallest_loss = test_loss
+                epochs_since_smallest = 0
+            else:
+                epochs_since_smallest += 1
+
+        logger.debug("instrument loss: %.2f, epochs=%s", training_loss / x.shape[0], epochs)
+        zhat = self._instrument_output_fn(z)
+        new_instrument_corr = np.corrcoef(zhat[:, 0], x[:, -1])[0, 1]
+
+        return zhat, new_instrument_corr
+
+
+    def fit_treatment(self, x, z, y, **kwargs):
 
         def split_data(X, Z, y, test=0.1):
             return train_test_split(X, Z, y, test_size=test, stratify=X[:, -1])
@@ -143,44 +187,10 @@ class FeedForwardModel(object):
 
         x_train, x_test, z_train, z_test, y_train, y_test  = split_data(x, z, y)
 
-        new_instrument_corr = None
-        if instrument:
-            epochs_since_smallest = -1
-            smallest_test_loss = 1e10
-            epochs = 0
-            while epochs_since_smallest < TOL:
-                epochs += 1
-                training_loss = 0
-                for batch in iterate_minibatches(x_train, y_train, z_train, batchsize=kwargs['batchsize'], shuffle=True):
-                    x_b, y_b, z_b = batch
-                    training_loss += self._instrument_train_fn(x_b[:, -1], z_b)
-
-                test_loss = self._instrument_loss_fn(x_test[:, -1], z_test)
-                logger.debug("treatment model -> train loss: %.2f, test loss: %.2f, epochs=%s", training_loss, test_loss, epochs)
-                if test_loss < smallest_test_loss:
-                    smallest_test_loss = test_loss
-                    epochs_since_smallest = 0
-                else:
-                    epochs_since_smallest += 1
-
-            # fit model on whole dataset
-            for _ in xrange(epochs):
-                training_loss = 0
-                for batch in iterate_minibatches(x, y, z, batchsize=kwargs['batchsize'], shuffle=True):
-                    x_b, y_b, z_b = batch
-                    training_loss += self._instrument_train_fn(x_b[:, -1], z_b)
-
-            logger.debug("instrument loss: %.2f, epochs=%s", training_loss / x.shape[0], epochs)
-
-            zhat = self._instrument_output_fn(z)
-            z[:, -1] = zhat[:, 0]
-
-            new_instrument_corr = np.corrcoef(zhat[:, 0], x[:, -1])[0, 1]
-
         epochs_since_smallest = -1
         smallest_loss = 1e10
         epochs = 0
-        while epochs_since_smallest < 10:
+        while epochs_since_smallest < TOL:
             epochs += 1
             training_loss = 0
             for x_b, z_b, y_b in iterate_minibatches(x, z, y, batchsize=kwargs['batchsize'], shuffle=True):
@@ -192,7 +202,6 @@ class FeedForwardModel(object):
             else:
                 epochs_since_smallest += 1
 
-        return new_instrument_corr
 
     def get_treatment_effect(self, x):
 
